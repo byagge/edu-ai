@@ -1,0 +1,1 @@
+"""Education-centre vertical."""
