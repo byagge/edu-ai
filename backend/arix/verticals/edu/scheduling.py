@@ -192,6 +192,16 @@ async def schedule_enrollment_jobs(
                 timezone=ctx.tz_name, quiet=ctx.settings.quiet,
             )
             armed.append("renew_reminder")
+        offer_day = enrollment.end_date - timedelta(days=14)
+        offer_at = combine_local(offer_day, parse_hhmm("11:00"), ctx.tz_name)
+        if offer_at > now_utc():
+            await jobs.enqueue(
+                session, ctx.id, "next_level_offer", offer_at,
+                dedupe_key=jobs.dedupe("next_level", enrollment_id),
+                payload={"enrollment_id": str(enrollment_id)},
+                timezone=ctx.tz_name, quiet=ctx.settings.quiet,
+            )
+            armed.append("next_level_offer")
 
     if ctx.settings.features.reviews:
         await jobs.enqueue(

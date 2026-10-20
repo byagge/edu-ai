@@ -183,6 +183,8 @@ def build_brain(playbook=None) -> Brain:
     deterministic path, which is why the vertical passes it in rather than this
     module importing it (see docs/CORE_SYNC.md).
     """
+    from .scripted import ScriptedBrain
+
     s = get_settings()
     if s.llm_enabled:
         return AnthropicBrain()
@@ -191,8 +193,6 @@ def build_brain(playbook=None) -> Brain:
             "no ANTHROPIC_API_KEY and no playbook: pass the vertical's playbook "
             "to build_brain(), or configure a key"
         )
-    from .scripted import ScriptedBrain
-
     return ScriptedBrain(playbook)
 
 

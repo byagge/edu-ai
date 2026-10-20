@@ -720,15 +720,31 @@ EDU_HANDLERS = {
 }
 
 
+async def arm_daily(session, ctx) -> None:
+    """Education-centre jobs armed every day from the shared worker."""
+    from arix.core.timeutil import local_date, now_utc
+    from arix.scheduler.jobs import arm_local
+
+    today = local_date(now_utc(), ctx.tz_name)
+    await arm_local(session, ctx, "lessons_rollout", "03:00")
+    await arm_local(session, ctx, "group_start_announce", "10:00")
+    if today.month in (8, 12) and today.day == 1:
+        await arm_local(session, ctx, "reactivation", "11:00", roll_forward=False)
+    if today.day == 1 and ctx.settings.features.parent_reports:
+        await arm_local(session, ctx, "parent_report", "12:00", roll_forward=False)
+
+
 def register() -> None:
     """Wire the edu module into the shared scheduler."""
     from arix.scheduler.registry import (
+        register_daily,
         register_handlers,
         register_report_builder,
         register_slot_hint,
     )
 
     register_handlers(EDU_HANDLERS)
+    register_daily(arm_daily)
     register_slot_hint(slot_hint)
     register_report_builder(lambda session, ctx, day: build_daily_report(session, ctx, day))
 

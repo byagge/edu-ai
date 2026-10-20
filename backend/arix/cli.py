@@ -23,7 +23,7 @@ from arix.core.context import load_context, load_context_by_slug
 from arix.db.session import admin_session, dispose_engine, tenant_session
 from arix.logging_setup import setup_logging
 
-DEMO_SLUG = "demo-dental"
+DEMO_SLUG = "demo-language"
 
 
 async def _slug_to_id(slug: str):
@@ -35,7 +35,7 @@ async def _slug_to_id(slug: str):
 
 
 async def cmd_seed_demo(args: argparse.Namespace) -> int:
-    """Create a demo clinic with services, doctors, staff, visits and dialogues."""
+    """Create a demo centre with courses, groups, students and invoices."""
     from arix.seed.provision import (
         create_tenant,
         ensure_channel,
@@ -188,22 +188,24 @@ async def cmd_wa_qr(args: argparse.Namespace) -> int:
     return 0
 
 
-async def cmd_import_prices(args: argparse.Namespace) -> int:
-    from arix.seed.imports import import_doctors_xlsx, import_prices_xlsx
+async def cmd_import_xlsx(args: argparse.Namespace) -> int:
+    from arix.seed.imports import import_courses_xlsx, import_groups_xlsx, import_students_xlsx
 
+    loaders = {
+        "courses": import_courses_xlsx,
+        "groups": import_groups_xlsx,
+        "students": import_students_xlsx,
+    }
     tenant_id = await _slug_to_id(args.slug)
     async with tenant_session(tenant_id) as session:
         ctx = await load_context(session, tenant_id)
-        if args.kind == "prices":
-            report = await import_prices_xlsx(session, ctx, args.file)
-        else:
-            report = await import_doctors_xlsx(session, ctx, args.file)
+        report = await loaders[args.kind](session, ctx, args.file)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 
 
 async def cmd_report(args: argparse.Namespace) -> int:
-    from arix.verticals.clinic.reports import build_daily_report, render_daily_report
+    from arix.verticals.edu.reports import build_daily_report, render_daily_report
 
     tenant_id = await _slug_to_id(args.slug)
     day = date.fromisoformat(args.day) if args.day else None
@@ -238,16 +240,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="arix", description="ARIX operations")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    seed = sub.add_parser("seed-demo", help="создать демо-клинику")
+    seed = sub.add_parser("seed-demo", help="создать демо-центр")
     seed.add_argument("--slug", default=DEMO_SLUG)
-    seed.add_argument("--name", default="Dental Smile")
-    seed.add_argument("--city", default="Шымкент")
-    seed.add_argument("--country", default="KZ")
-    seed.add_argument("--timezone", default="Asia/Almaty")
-    seed.add_argument("--languages", default="ru,kz")
-    seed.add_argument("--template", default="clinic_dental")
-    seed.add_argument("--address", default="ул. Абая 10, Шымкент")
-    seed.add_argument("--phone", default="+7 7252 00 00 00")
+    seed.add_argument("--name", default="Lingua House")
+    seed.add_argument("--city", default="Ташкент")
+    seed.add_argument("--country", default="UZ")
+    seed.add_argument("--timezone", default="Asia/Tashkent")
+    seed.add_argument("--languages", default="ru,uz")
+    seed.add_argument("--template", default="edu_language")
+    seed.add_argument("--address", default="ул. Амира Темура 15, Ташкент")
+    seed.add_argument("--phone", default="+998 71 000 00 00")
     seed.add_argument("--password", default="demo12345")
     seed.add_argument("--owner-tg", type=int, default=None)
     seed.add_argument("--admin-tg", type=int, default=None)
@@ -260,7 +262,7 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--country", default="KZ")
     create.add_argument("--timezone", default="Asia/Almaty")
     create.add_argument("--languages", default="ru")
-    create.add_argument("--template", default="clinic_dental")
+    create.add_argument("--template", default="edu_language")
     create.add_argument("--status", default="pilot")
     create.set_defaults(func=cmd_create_tenant)
 
@@ -286,11 +288,11 @@ def build_parser() -> argparse.ArgumentParser:
     wa.add_argument("--slug", required=True)
     wa.set_defaults(func=cmd_wa_qr)
 
-    imports = sub.add_parser("import-prices", help="импорт прайса или врачей из Excel")
+    imports = sub.add_parser("import-xlsx", help="импорт курсов, групп или учеников из Excel")
     imports.add_argument("--slug", required=True)
     imports.add_argument("--file", required=True)
-    imports.add_argument("--kind", choices=["prices", "doctors"], default="prices")
-    imports.set_defaults(func=cmd_import_prices)
+    imports.add_argument("--kind", choices=["courses", "groups", "students"], required=True)
+    imports.set_defaults(func=cmd_import_xlsx)
 
     report = sub.add_parser("report", help="утренний отчёт владельцу")
     report.add_argument("--slug", required=True)

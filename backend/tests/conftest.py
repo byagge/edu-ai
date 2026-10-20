@@ -17,6 +17,7 @@ TEST_DB = os.getenv(
 )
 
 # Settings must be in place before any arix module reads them.
+os.environ.setdefault("VERTICAL", "edu")
 os.environ.setdefault("DATABASE_URL", TEST_DB)
 os.environ.setdefault("LLM_FORCE_SCRIPTED", "true")
 os.environ.setdefault("CHANNELS_DRY_RUN", "true")
@@ -98,11 +99,12 @@ async def clean_db() -> AsyncIterator[None]:
     from arix.db.session import get_engine
 
     tables = (
-        "reviews, visits, waitlist, treatment_plans, schedule_exceptions, schedules, "
-        "doctor_services, services, doctors, rooms, daily_metrics, audit_log, "
-        "outbound_counters, payments, events, handoffs, sequences, scheduled_jobs, "
-        "kb_items, messages, conversations, contact_identities, contacts, channels, "
-        "channel_routes, staff, tenant_config, tenants"
+        "attendance, lessons, test_results, level_tests, referrals, invoices, "
+        "enrollments, trial_bookings, trial_lessons, guardians, students, waitlist, "
+        "groups, teachers, courses, daily_metrics, audit_log, outbound_counters, "
+        "payments, events, handoffs, sequences, scheduled_jobs, kb_items, messages, "
+        "conversations, contact_identities, contacts, channels, channel_routes, staff, "
+        "tenant_config, tenants"
     )
     async with get_engine().begin() as connection:
         await connection.execute(text(f"TRUNCATE {tables} CASCADE"))
@@ -114,7 +116,7 @@ async def clean_db() -> AsyncIterator[None]:
 
 @pytest.fixture
 async def tenant(clean_db):
-    """A provisioned dental clinic with a dry-run Telegram channel and staff."""
+    """A provisioned language centre with a dry-run Telegram channel and staff."""
     from arix.db.session import admin_session
     from arix.seed.provision import create_tenant, ensure_channel, ensure_staff
 
@@ -123,12 +125,13 @@ async def tenant(clean_db):
         result = await create_tenant(
             session,
             slug=slug,
-            name="Dental Smile",
-            city="Шымкент",
-            timezone="Asia/Almaty",
-            languages=["ru", "kz"],
-            template_code="clinic_dental",
+            name="Lingua House",
+            city="Ташкент",
+            timezone="Asia/Tashkent",
+            languages=["ru", "uz"],
+            template_code="edu_language",
             status="pilot",
+            country="UZ",
         )
         tenant_id = result.tenant.id
         await ensure_channel(
@@ -152,8 +155,8 @@ async def ctx(tenant):
 
 @pytest.fixture
 def runtime():
-    from arix.verticals.clinic.adapter import build_runtime
-    from arix.verticals.clinic.handlers import register
+    from arix.verticals.edu.adapter import build_runtime
+    from arix.verticals.edu.handlers import register
 
     register()
     return build_runtime()

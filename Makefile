@@ -1,4 +1,4 @@
-# ARIX clinic — частые операции.
+# ARIX edu — частые операции.
 SHELL := /bin/bash
 COMPOSE := docker compose
 BACKEND := cd backend && PYTHONPATH=$$PWD
@@ -11,18 +11,19 @@ help: ## Показать это сообщение
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | \
 	  awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
-demo: ## Полный демо-стенд: поднять всё, применить миграции, засеять демо-клинику
+demo: ## Полный демо-стенд: поднять всё, применить миграции, засеять демо-центр
 	@test -f .env || cp .env.example .env
 	$(COMPOSE) up -d --build postgres redis
 	$(COMPOSE) run --rm migrate
 	$(COMPOSE) up -d --build backend worker waweb frontend
 	$(COMPOSE) run --rm seed
-	@echo
-	@echo "Готово."
-	@echo "  API:        http://localhost:$${BACKEND_PORT:-8000}/docs"
-	@echo "  Панель:     http://localhost:$${FRONTEND_PORT:-3000}"
-	@echo "  WhatsApp QR: http://localhost:$${WAWEB_PORT:-3001}/health"
-	@echo "  Дальше:     docs/DEMO.md"
+	@set -a; . ./.env; set +a; \
+	  echo; \
+	  echo "Готово."; \
+	  echo "  API:         http://localhost:$${BACKEND_PORT:-8001}/docs"; \
+	  echo "  Панель:      http://localhost:$${FRONTEND_PORT:-3002}"; \
+	  echo "  WhatsApp QR: http://localhost:$${WAWEB_PORT:-3003}/health"; \
+	  echo "  Дальше:      docs/DEMO.md"
 
 up: ## Поднять стек
 	$(COMPOSE) up -d --build
@@ -45,10 +46,10 @@ migrate: ## Применить миграции
 revision: ## Создать миграцию: make revision m="add x"
 	$(BACKEND) python -m alembic revision --autogenerate -m "$(m)"
 
-seed: ## Засеять демо-клинику с диалогами и записями
+seed: ## Засеять демо-центр (курсы, группы, ученики, счета)
 	$(COMPOSE) run --rm seed
 
-eval: ## Прогнать eval-набор из 60+ диалогов (ТЗ §15)
+eval: ## Прогнать стартовый eval (полный набор 60 диалогов — задача P1-1)
 	$(BACKEND) python -m arix.eval.runner
 
 test: ## Все тесты
@@ -70,9 +71,11 @@ psql: ## psql в базу
 	$(COMPOSE) exec postgres psql -U postgres -d $${POSTGRES_DB:-arix}
 
 smoke: ## Проверить, что живое API отвечает
-	@curl -fsS http://localhost:$${BACKEND_PORT:-8000}/health/ready | python3 -m json.tool
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	  curl -fsS "http://localhost:$${BACKEND_PORT:-8001}/health/ready" | python3 -m json.tool
 
 tunnel-hint: ## Как отдать вебхуки наружу для реального Telegram/WhatsApp
-	@echo "1) cloudflared tunnel --url http://localhost:$${BACKEND_PORT:-8000}"
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	  echo "1) cloudflared tunnel --url http://localhost:$${BACKEND_PORT:-8001}"
 	@echo "2) PUBLIC_BASE_URL=<адрес туннеля> в .env"
 	@echo "3) make up && см. docs/DEMO.md про подключение каналов"

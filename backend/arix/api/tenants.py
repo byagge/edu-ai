@@ -325,7 +325,7 @@ async def generate_demo(
     if not s.demo_enabled:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "demo generation is disabled")
 
-    template = pick_by_rubrics(body.rubrics, vertical=s.vertical, default="clinic_dental")
+    template = pick_by_rubrics(body.rubrics, vertical=s.vertical, default="edu_language")
     slug = _slugify(body.name, body.city)
     timezone = body.timezone or ("Asia/Tashkent" if body.country.upper() == "UZ" else "Asia/Almaty")
     languages = body.languages or (["uz", "ru"] if body.country.upper() == "UZ" else ["ru", "kz"])

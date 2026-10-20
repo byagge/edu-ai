@@ -26,7 +26,7 @@ from arix.core.crypto import decrypt_json, verify_signature
 from arix.db.models_core import Channel, Tenant
 from arix.db.session import admin_session, tenant_session
 from arix.logging_setup import bind_context, get_logger
-from arix.verticals.clinic.adapter import build_runtime
+from arix.verticals.edu.adapter import build_runtime
 
 log = get_logger("arix.webhooks")
 router = APIRouter(tags=["webhooks"])
@@ -438,6 +438,10 @@ async def payment_webhook(provider: str, slug: str, request: Request) -> dict:
         )
         if payment is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown payment")
+        if payment.status == "paid":
+            from arix.verticals.edu.settlement import settle_payment
+
+            await settle_payment(session, ctx, payment)
     return {"ok": True, "error": 0, "error_note": "Success"}
 
 

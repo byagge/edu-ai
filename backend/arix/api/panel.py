@@ -1,415 +1,438 @@
-"""Tenant panel API: calendar, manual bookings, prices, doctors, KB, stats.
+"""Tenant panel for an education centre.
 
-Manual (phone) bookings MUST go through ``POST /visits`` — that is the whole
-point of the panel.  A visit created here occupies the same exclusion
-constraint as a bot booking, so the bot can never double-book over it.
+Courses, groups, students, invoices and attendance. Dialogues, the knowledge
+base and the owner report stay on the shared models.
 """
 from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 
-from arix.core.events import BOOKING_CONFIRMED, log_event
-from arix.core.pii import normalize_phone
-from arix.core.timeutil import combine_local, local_date, now_utc, to_tenant
-from arix.db.models_core import Contact, Conversation, DailyMetric, Event, Handoff, KBItem, Message
-from arix.verticals.clinic import booking as bk
-from arix.verticals.clinic.models import (
-    Doctor,
-    DoctorService,
-    Schedule,
-    ScheduleException,
-    Service,
-    Visit,
+from arix.core.timeutil import now_utc
+from arix.db.models_core import (
+    Contact,
+    Conversation,
+    DailyMetric,
+    Event,
+    Handoff,
+    KBItem,
+    Message,
+    Payment,
 )
-from arix.verticals.clinic.reports import build_daily_report, render_daily_report
-from arix.verticals.clinic.scheduling import cancel_visit_jobs, schedule_visit_jobs
+from arix.payments import mark_paid
+from arix.verticals.edu import attendance as att
+from arix.verticals.edu import billing as bl
+from arix.verticals.edu import enrollment as en
+from arix.verticals.edu.models import (
+    Course,
+    Enrollment,
+    Group,
+    Invoice,
+    Lesson,
+    Student,
+    Teacher,
+    TrialLesson,
+)
+from arix.verticals.edu.reports import build_daily_report, render_daily_report
+from arix.verticals.edu.scheduling import schedule_enrollment_jobs
+from arix.verticals.edu.settlement import settle_payment
 
 from .deps import TenantSession, tenant_scope
-from .schemas import (
-    DoctorIn,
-    DoctorOut,
-    KBItemIn,
-    ManualBooking,
-    PriceQuickPatch,
-    ScheduleExceptionIn,
-    ScheduleIn,
-    ServiceIn,
-    ServiceOut,
-    SlotOut,
-    VisitOut,
-    VisitStatusPatch,
-)
+from .schemas import KBItemIn
 
 router = APIRouter(prefix="/panel/{tenant_id}", tags=["panel"])
 
 Scope = Annotated[TenantSession, Depends(tenant_scope)]
 
 
-# ---------------------------------------------------------------- services --
-@router.get("/services", response_model=list[ServiceOut])
-async def list_services(scope: Scope) -> list[Service]:
-    return list(
-        (
-            await scope.session.execute(
-                select(Service)
-                .where(Service.tenant_id == scope.ctx.id)
-                .order_by(Service.sort, Service.code)
-            )
-        ).scalars()
+class CourseIn(BaseModel):
+    code: str
+    name: dict[str, str]
+    direction: str = "lang"
+    price_month: float | None = None
+    currency: str = "UZS"
+    lessons_per_week: int = 2
+    lesson_min: int = 90
+    age_from: int | None = None
+    age_to: int | None = None
+    level_from: str | None = None
+    level_to: str | None = None
+    has_trial: bool = True
+    has_level_test: bool = False
+    goal_keywords: list[str] = Field(default_factory=list)
+
+
+class GroupIn(BaseModel):
+    course_id: uuid.UUID
+    name: str
+    teacher_id: uuid.UUID | None = None
+    level: str | None = None
+    schedule: dict = Field(default_factory=dict)
+    capacity: int = 10
+    min_to_start: int = 4
+    start_date: date | None = None
+    price_month: float | None = None
+    room: str | None = None
+
+
+class StudentIn(BaseModel):
+    name: str
+    birth_year: int | None = None
+    phone: str | None = None
+    contact_name: str | None = None
+
+
+class EnrollIn(BaseModel):
+    student_id: uuid.UUID
+    group_id: uuid.UUID
+    discount_pct: int = 0
+    start_date: date | None = None
+
+
+class AttendanceIn(BaseModel):
+    lesson_id: uuid.UUID
+    absent_student_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
+class LessonCancelIn(BaseModel):
+    reason: str | None = None
+    moved_to: datetime | None = None
+
+
+# ---------------------------------------------------------------- courses ---
+@router.get("/courses")
+async def list_courses(scope: Scope) -> list[dict]:
+    rows = (
+        await scope.session.execute(
+            select(Course)
+            .where(Course.tenant_id == scope.ctx.id, Course.active.is_(True))
+            .order_by(Course.sort, Course.code)
+        )
+    ).scalars()
+    return [
+        {
+            "id": str(row.id),
+            "code": row.code,
+            "name": row.label("ru"),
+            "direction": row.direction,
+            "price_month": float(row.price_month) if row.price_month is not None else None,
+            "currency": row.currency,
+            "lessons_per_week": row.lessons_per_week,
+            "has_trial": row.has_trial,
+            "has_level_test": row.has_level_test,
+        }
+        for row in rows
+    ]
+
+
+@router.post("/courses", status_code=201)
+async def create_course(body: CourseIn, scope: Scope) -> dict:
+    row = Course(
+        tenant_id=scope.ctx.id,
+        code=body.code,
+        name=body.name,
+        direction=body.direction,
+        price_month=Decimal(str(body.price_month)) if body.price_month is not None else None,
+        currency=body.currency,
+        lessons_per_week=body.lessons_per_week,
+        lesson_min=body.lesson_min,
+        age_from=body.age_from,
+        age_to=body.age_to,
+        level_from=body.level_from,
+        level_to=body.level_to,
+        has_trial=body.has_trial,
+        has_level_test=body.has_level_test,
+        goal_keywords=body.goal_keywords,
     )
-
-
-@router.post("/services", response_model=ServiceOut, status_code=201)
-async def create_service(body: ServiceIn, scope: Scope) -> Service:
-    service = Service(tenant_id=scope.ctx.id, **body.model_dump())
-    scope.session.add(service)
-    await scope.session.flush()
-    return service
-
-
-@router.put("/services/{service_id}", response_model=ServiceOut)
-async def update_service(service_id: uuid.UUID, body: ServiceIn, scope: Scope) -> Service:
-    service = await bk.get_service(scope.session, scope.ctx.id, service_id)
-    if service is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown service")
-    for key, value in body.model_dump().items():
-        setattr(service, key, value)
-    await scope.session.flush()
-    return service
-
-
-@router.post("/prices/quick")
-async def quick_price(body: PriceQuickPatch, scope: Scope) -> dict:
-    """What ``/prices`` in the owner bot calls."""
-    service = (
-        await scope.session.execute(
-            select(Service).where(
-                Service.tenant_id == scope.ctx.id, Service.code == body.service_code
-            )
-        )
-    ).scalar_one_or_none()
-    if service is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown service code")
-    if body.price_from is not None:
-        service.price_from = body.price_from
-    if body.price_to is not None:
-        service.price_to = body.price_to
-    await scope.session.flush()
-    return {
-        "code": service.code,
-        "price_from": float(service.price_from or 0),
-        "price_to": float(service.price_to or 0),
-    }
-
-
-# ----------------------------------------------------------------- doctors --
-@router.get("/doctors", response_model=list[DoctorOut])
-async def list_doctors(scope: Scope) -> list[Doctor]:
-    return await bk.list_doctors(scope.session, scope.ctx.id)
-
-
-@router.post("/doctors", response_model=DoctorOut, status_code=201)
-async def create_doctor(body: DoctorIn, scope: Scope) -> Doctor:
-    payload = body.model_dump()
-    service_ids = payload.pop("service_ids", [])
-    doctor = Doctor(tenant_id=scope.ctx.id, **payload)
-    scope.session.add(doctor)
-    await scope.session.flush()
-    for service_id in service_ids:
-        scope.session.add(
-            DoctorService(
-                tenant_id=scope.ctx.id, doctor_id=doctor.id, service_id=service_id
-            )
-        )
-    await scope.session.flush()
-    return doctor
-
-
-@router.put("/doctors/{doctor_id}", response_model=DoctorOut)
-async def update_doctor(doctor_id: uuid.UUID, body: DoctorIn, scope: Scope) -> Doctor:
-    doctor = (
-        await scope.session.execute(
-            select(Doctor).where(Doctor.tenant_id == scope.ctx.id, Doctor.id == doctor_id)
-        )
-    ).scalar_one_or_none()
-    if doctor is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown doctor")
-    payload = body.model_dump()
-    service_ids = payload.pop("service_ids", None)
-    for key, value in payload.items():
-        setattr(doctor, key, value)
-    if service_ids is not None:
-        await scope.session.execute(
-            delete(DoctorService).where(DoctorService.doctor_id == doctor_id)
-        )
-        for service_id in service_ids:
-            scope.session.add(
-                DoctorService(
-                    tenant_id=scope.ctx.id, doctor_id=doctor_id, service_id=service_id
-                )
-            )
-    await scope.session.flush()
-    return doctor
-
-
-# --------------------------------------------------------------- schedules --
-@router.get("/schedules")
-async def list_schedules(scope: Scope, doctor_id: uuid.UUID | None = None) -> dict:
-    stmt = select(Schedule).where(Schedule.tenant_id == scope.ctx.id)
-    if doctor_id:
-        stmt = stmt.where(Schedule.doctor_id == doctor_id)
-    weekly = list((await scope.session.execute(stmt.order_by(Schedule.weekday))).scalars())
-    exc_stmt = select(ScheduleException).where(
-        ScheduleException.tenant_id == scope.ctx.id,
-        ScheduleException.date >= local_date(now_utc(), scope.ctx.tz_name),
-    )
-    if doctor_id:
-        exc_stmt = exc_stmt.where(ScheduleException.doctor_id == doctor_id)
-    exceptions = list((await scope.session.execute(exc_stmt)).scalars())
-    return {
-        "weekly": [
-            {
-                "id": str(row.id),
-                "doctor_id": str(row.doctor_id),
-                "weekday": row.weekday,
-                "start": row.start.isoformat(),
-                "end": row.end.isoformat(),
-                "break_start": row.break_start.isoformat() if row.break_start else None,
-                "break_end": row.break_end.isoformat() if row.break_end else None,
-            }
-            for row in weekly
-        ],
-        "exceptions": [
-            {
-                "id": str(row.id),
-                "doctor_id": str(row.doctor_id),
-                "date": row.date.isoformat(),
-                "type": row.type,
-                "start": row.start.isoformat() if row.start else None,
-                "end": row.end.isoformat() if row.end else None,
-                "note": row.note,
-            }
-            for row in exceptions
-        ],
-    }
-
-
-@router.post("/schedules", status_code=201)
-async def create_schedule(body: ScheduleIn, scope: Scope) -> dict:
-    row = Schedule(tenant_id=scope.ctx.id, **body.model_dump())
     scope.session.add(row)
     await scope.session.flush()
     return {"id": str(row.id)}
 
 
-@router.delete("/schedules/{schedule_id}", status_code=204)
-async def delete_schedule(schedule_id: uuid.UUID, scope: Scope) -> None:
-    await scope.session.execute(
-        delete(Schedule).where(
-            Schedule.tenant_id == scope.ctx.id, Schedule.id == schedule_id
-        )
-    )
-
-
-@router.post("/schedule-exceptions", status_code=201)
-async def create_exception(body: ScheduleExceptionIn, scope: Scope) -> dict:
-    """``/off`` in the owner bot: "врач не работает в этот день"."""
-    row = ScheduleException(tenant_id=scope.ctx.id, **body.model_dump())
-    scope.session.add(row)
-    await scope.session.flush()
-    # Visits already booked into the removed window need a human decision.
-    day_start = combine_local(body.date, datetime.min.time(), scope.ctx.tz_name)
-    clashing = await bk.visits_in_window(
-        scope.session, scope.ctx.id, day_start, day_start + timedelta(days=1),
-        statuses=["booked", "confirmed", "hold"],
-    )
-    affected = [str(v.id) for v in clashing if v.doctor_id == body.doctor_id]
-    return {"id": str(row.id), "affected_visits": affected}
-
-
-# ------------------------------------------------------------------- slots --
-@router.get("/slots", response_model=list[SlotOut])
-async def slots(
-    scope: Scope,
-    service_id: uuid.UUID,
-    doctor_id: uuid.UUID | None = None,
-    date_from: date | None = None,
-    date_to: date | None = None,
-    part_of_day: str | None = None,
-    count: int = Query(default=12, le=50),
-) -> list[SlotOut]:
-    offers = await bk.find_slots(
-        scope.session, scope.ctx,
-        service_id=service_id, doctor_id=doctor_id,
-        date_from=date_from, date_to=date_to, part_of_day=part_of_day, count=count,
-        min_lead_minutes=0,
-    )
-    tz = scope.ctx.tz_name
-    return [
-        SlotOut(
-            slot_key=o.key, start=o.start, end=o.end, doctor_id=o.doctor_id,
-            doctor=o.doctor_name, service_id=o.service_id, service=o.service_name,
-            time=to_tenant(o.start, tz).strftime("%H:%M"),
-            date=to_tenant(o.start, tz).strftime("%Y-%m-%d"),
-        )
-        for o in offers
-    ]
-
-
-# ------------------------------------------------------------------ visits --
-@router.get("/visits", response_model=list[VisitOut])
-async def list_visits(
-    scope: Scope,
-    day: date | None = None,
-    days: int = Query(default=1, ge=1, le=31),
-    doctor_id: uuid.UUID | None = None,
-) -> list[VisitOut]:
-    tz = scope.ctx.tz_name
-    day = day or local_date(now_utc(), tz)
-    start = combine_local(day, datetime.min.time(), tz)
+@router.get("/groups")
+async def list_groups(scope: Scope) -> list[dict]:
     rows = (
         await scope.session.execute(
-            select(Visit, Doctor, Service, Contact)
-            .join(Doctor, Doctor.id == Visit.doctor_id)
-            .join(Service, Service.id == Visit.service_id)
-            .join(Contact, Contact.id == Visit.contact_id)
-            .where(
-                Visit.tenant_id == scope.ctx.id,
-                Visit.starts_at >= start,
-                Visit.starts_at < start + timedelta(days=days),
-                *( [Visit.doctor_id == doctor_id] if doctor_id else [] ),
-            )
-            .order_by(Visit.starts_at)
+            select(Group).where(Group.tenant_id == scope.ctx.id).order_by(Group.name)
         )
-    ).all()
+    ).scalars()
+    out = []
+    for group in rows:
+        taken = await en.seats_taken(scope.session, scope.ctx.id, group.id)
+        out.append(
+            {
+                "id": str(group.id),
+                "name": group.name,
+                "course_id": str(group.course_id),
+                "course": group.course.label("ru") if group.course else None,
+                "status": group.status,
+                "capacity": group.capacity,
+                "taken": taken,
+                "min_to_start": group.min_to_start,
+                "short": max(0, group.min_to_start - taken),
+                "schedule": group.schedule,
+                "level": group.level,
+                "start_date": group.start_date,
+            }
+        )
+    return out
+
+
+@router.post("/groups", status_code=201)
+async def create_group(body: GroupIn, scope: Scope) -> dict:
+    row = Group(
+        tenant_id=scope.ctx.id,
+        course_id=body.course_id,
+        teacher_id=body.teacher_id,
+        name=body.name,
+        level=body.level,
+        schedule=body.schedule,
+        capacity=body.capacity,
+        min_to_start=body.min_to_start,
+        start_date=body.start_date,
+        price_month=Decimal(str(body.price_month)) if body.price_month is not None else None,
+        room=body.room,
+    )
+    scope.session.add(row)
+    await scope.session.flush()
+    return {"id": str(row.id)}
+
+
+@router.get("/teachers")
+async def list_teachers(scope: Scope) -> list[dict]:
+    rows = (
+        await scope.session.execute(
+            select(Teacher).where(Teacher.tenant_id == scope.ctx.id, Teacher.active.is_(True))
+        )
+    ).scalars()
+    return [{"id": str(row.id), "name": row.name, "subjects": list(row.subjects or [])} for row in rows]
+
+
+@router.get("/students")
+async def list_students(scope: Scope, status_filter: str | None = None) -> list[dict]:
+    stmt = select(Student).where(Student.tenant_id == scope.ctx.id).order_by(Student.name)
+    if status_filter:
+        stmt = stmt.where(Student.status == status_filter)
+    rows = (await scope.session.execute(stmt.limit(500))).scalars()
     return [
-        VisitOut(
-            id=visit.id, starts_at=visit.starts_at, ends_at=visit.ends_at,
-            status=visit.status, source=visit.source, attribution=visit.attribution,
-            doctor_id=doctor.id, doctor=doctor.name,
-            service_id=service.id, service=service.label("ru"),
-            contact_id=contact.id, contact_name=contact.name, contact_phone=contact.phone,
-        )
-        for visit, doctor, service, contact in rows
+        {
+            "id": str(row.id),
+            "name": row.name,
+            "status": row.status,
+            "level": row.level,
+            "birth_year": row.birth_year,
+            "churn_risk_at": row.churn_risk_at,
+        }
+        for row in rows
     ]
 
 
-@router.post("/visits", response_model=VisitOut, status_code=201)
-async def create_manual_visit(body: ManualBooking, scope: Scope) -> VisitOut:
-    """Add a phone booking. Returns 409 when the slot is already taken."""
-    session, ctx = scope.session, scope.ctx
-    contact_id = body.contact_id
-    if contact_id is None:
-        phone = normalize_phone(body.contact_phone, ctx.tenant.country)
-        contact = None
-        if phone:
-            contact = (
-                await session.execute(
-                    select(Contact).where(Contact.tenant_id == ctx.id, Contact.phone == phone)
-                )
-            ).scalar_one_or_none()
-        if contact is None:
-            contact = Contact(
-                tenant_id=ctx.id, phone=phone, name=body.contact_name,
-                lang=ctx.default_lang, source="admin", consent_pd_at=now_utc(),
-            )
-            session.add(contact)
-            await session.flush()
-        contact_id = contact.id
-
-    try:
-        visit = await bk.hold_slot(
-            session, ctx,
-            contact_id=contact_id, doctor_id=body.doctor_id, service_id=body.service_id,
-            start=body.start, source="admin", attribution="admin",
-            idempotency_key=f"admin:{body.doctor_id}:{body.start.isoformat()}",
+@router.post("/students", status_code=201)
+async def create_student(body: StudentIn, scope: Scope) -> dict:
+    contact = None
+    if body.phone:
+        contact = Contact(
+            tenant_id=scope.ctx.id,
+            name=body.contact_name or body.name,
+            phone=body.phone,
+            lang=scope.ctx.default_lang,
+            source="admin",
         )
-    except bk.SlotTaken as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, "slot is already taken") from exc
-    except ValueError as exc:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-
-    visit.status = body.status if body.status in ("booked", "confirmed") else "booked"
-    visit.hold_expires_at = None
-    visit.confirmed_at = now_utc() if visit.status == "confirmed" else None
-    visit.note = body.note
-    await session.flush()
-    await schedule_visit_jobs(session, ctx, visit.id)
-    await log_event(
-        session, ctx.id, BOOKING_CONFIRMED, contact_id=contact_id,
-        entity_ref=str(visit.id), source="admin",
+        scope.session.add(contact)
+        await scope.session.flush()
+    student = Student(
+        tenant_id=scope.ctx.id,
+        contact_id=contact.id if contact else None,
+        name=body.name,
+        birth_year=body.birth_year,
+        status="lead",
     )
-
-    refs = await bk.visit_with_refs(session, ctx.id, visit.id)
-    assert refs is not None
-    v, doctor, service, contact = refs
-    return VisitOut(
-        id=v.id, starts_at=v.starts_at, ends_at=v.ends_at, status=v.status,
-        source=v.source, attribution=v.attribution,
-        doctor_id=doctor.id, doctor=doctor.name,
-        service_id=service.id, service=service.label("ru"),
-        contact_id=contact.id, contact_name=contact.name, contact_phone=contact.phone,
-    )
+    scope.session.add(student)
+    await scope.session.flush()
+    return {"id": str(student.id), "contact_id": str(contact.id) if contact else None}
 
 
-@router.patch("/visits/{visit_id}/status")
-async def patch_visit_status(
-    visit_id: uuid.UUID, body: VisitStatusPatch, scope: Scope
-) -> dict:
-    from arix.verticals.clinic.handlers import schedule_noshow_rebook
-    from arix.verticals.clinic.scheduling import schedule_after_visit
-
-    allowed = ("confirmed", "arrived", "no_show", "cancelled", "done")
-    if body.status not in allowed:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"status must be one of {allowed}")
-    visit = await bk.set_status(scope.session, scope.ctx, visit_id, body.status, reason=body.reason)
-    if visit is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown visit")
-
-    if body.status == "done":
-        contact = (
-            await scope.session.execute(select(Contact).where(Contact.id == visit.contact_id))
-        ).scalar_one()
-        contact.last_visit_at = visit.starts_at
-        await schedule_after_visit(scope.session, scope.ctx, visit_id)
-    elif body.status == "no_show":
-        await schedule_noshow_rebook(scope.session, scope.ctx, visit_id)
-        await cancel_visit_jobs(scope.session, scope.ctx, visit_id)
-    elif body.status == "cancelled":
-        await cancel_visit_jobs(scope.session, scope.ctx, visit_id)
-    return {"id": str(visit.id), "status": visit.status}
+@router.get("/enrollments")
+async def list_enrollments(scope: Scope, group_id: uuid.UUID | None = None) -> list[dict]:
+    stmt = select(Enrollment, Student, Group).join(
+        Student, Student.id == Enrollment.student_id
+    ).join(Group, Group.id == Enrollment.group_id).where(Enrollment.tenant_id == scope.ctx.id)
+    if group_id:
+        stmt = stmt.where(Enrollment.group_id == group_id)
+    rows = (await scope.session.execute(stmt.limit(500))).all()
+    return [
+        {
+            "id": str(enrollment.id),
+            "student_id": str(student.id),
+            "student": student.name,
+            "group_id": str(group.id),
+            "group": group.name,
+            "status": enrollment.status,
+            "price_month": float(enrollment.price_month),
+            "start_date": enrollment.start_date,
+        }
+        for enrollment, student, group in rows
+    ]
 
 
-@router.post("/visits/{visit_id}/reschedule", response_model=VisitOut)
-async def reschedule_visit(visit_id: uuid.UUID, slot_key: str, scope: Scope) -> VisitOut:
+@router.post("/enrollments", status_code=201)
+async def create_enrollment(body: EnrollIn, scope: Scope) -> dict:
     try:
-        doctor_id, _service_id, start = bk.SlotOffer.parse_key(slot_key)
-    except (ValueError, AttributeError) as exc:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "bad slot_key") from exc
-    try:
-        moved = await bk.reschedule(
-            scope.session, scope.ctx, visit_id, start, new_doctor_id=doctor_id
+        enrollment, invoice = await en.enroll(
+            scope.session, scope.ctx,
+            student_id=body.student_id,
+            group_id=body.group_id,
+            attribution="admin",
+            start_date=body.start_date,
+            discount_pct=body.discount_pct,
+            idempotency_key=f"panel:{body.student_id}:{body.group_id}",
         )
-    except bk.SlotTaken as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, "slot is already taken") from exc
-    except ValueError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown visit") from exc
-    await cancel_visit_jobs(scope.session, scope.ctx, visit_id)
-    await schedule_visit_jobs(scope.session, scope.ctx, moved.id)
-    refs = await bk.visit_with_refs(scope.session, scope.ctx.id, moved.id)
-    assert refs is not None
-    v, doctor, service, contact = refs
-    return VisitOut(
-        id=v.id, starts_at=v.starts_at, ends_at=v.ends_at, status=v.status,
-        source=v.source, attribution=v.attribution, doctor_id=doctor.id, doctor=doctor.name,
-        service_id=service.id, service=service.label("ru"),
-        contact_id=contact.id, contact_name=contact.name, contact_phone=contact.phone,
+    except en.SeatsFull as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, "group is full") from exc
+    except en.AlreadyEnrolled as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, "already enrolled") from exc
+    await schedule_enrollment_jobs(scope.session, scope.ctx, enrollment.id)
+    return {
+        "id": str(enrollment.id),
+        "invoice_id": str(invoice.id) if invoice else None,
+        "amount": float(invoice.amount) if invoice else None,
+    }
+
+
+@router.get("/invoices")
+async def list_invoices(scope: Scope, open_only: bool = True) -> list[dict]:
+    stmt = select(Invoice, Student).join(Student, Student.id == Invoice.student_id).where(
+        Invoice.tenant_id == scope.ctx.id
     )
+    if open_only:
+        stmt = stmt.where(Invoice.status.in_(["open", "overdue"]))
+    rows = (await scope.session.execute(stmt.order_by(Invoice.due_date).limit(500))).all()
+    return [
+        {
+            "id": str(invoice.id),
+            "student_id": str(student.id),
+            "student": student.name,
+            "period": invoice.period,
+            "amount": float(invoice.amount),
+            "currency": invoice.currency,
+            "due_date": invoice.due_date,
+            "status": invoice.status,
+            "note": invoice.note,
+        }
+        for invoice, student in rows
+    ]
+
+
+@router.post("/invoices/{invoice_id}/paid")
+async def mark_invoice_cash(invoice_id: uuid.UUID, scope: Scope) -> dict:
+    """Owner marks a transfer or cash payment. Stops the debt ladder."""
+    invoice = (
+        await scope.session.execute(
+            select(Invoice).where(Invoice.tenant_id == scope.ctx.id, Invoice.id == invoice_id)
+        )
+    ).scalar_one_or_none()
+    if invoice is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown invoice")
+    if invoice.status == "paid":
+        return {"ok": True, "status": "paid"}
+    payment = Payment(
+        tenant_id=scope.ctx.id,
+        provider="manual",
+        amount=invoice.amount,
+        currency=invoice.currency,
+        status="created",
+        attributed_to="cash",
+        entity_ref=str(invoice.id),
+        external_id=f"cash:{invoice.id}",
+    )
+    scope.session.add(payment)
+    await scope.session.flush()
+    paid = await mark_paid(scope.session, scope.ctx, payment.id, provider_ref="cash")
+    if paid is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "payment was not recorded")
+    await settle_payment(scope.session, scope.ctx, paid)
+    return {"ok": True, "status": "paid", "payment_id": str(paid.id)}
+
+
+@router.get("/lessons")
+async def list_lessons(
+    scope: Scope, day: date | None = None, group_id: uuid.UUID | None = None
+) -> list[dict]:
+    stmt = select(Lesson, Group).join(Group, Group.id == Lesson.group_id).where(
+        Lesson.tenant_id == scope.ctx.id
+    )
+    if group_id:
+        stmt = stmt.where(Lesson.group_id == group_id)
+    if day:
+        start = datetime.combine(day, datetime.min.time())
+        stmt = stmt.where(Lesson.starts_at >= start, Lesson.starts_at < start + timedelta(days=1))
+    rows = (await scope.session.execute(stmt.order_by(Lesson.starts_at).limit(200))).all()
+    return [
+        {
+            "id": str(lesson.id),
+            "group_id": str(group.id),
+            "group": group.name,
+            "starts_at": lesson.starts_at,
+            "status": lesson.status,
+            "topic": lesson.topic,
+        }
+        for lesson, group in rows
+    ]
+
+
+@router.post("/lessons/{lesson_id}/cancel")
+async def cancel_lesson(lesson_id: uuid.UUID, body: LessonCancelIn, scope: Scope) -> dict:
+    pair = await att.cancel_lesson(
+        scope.session, scope.ctx, lesson_id, reason=body.reason, moved_to=body.moved_to
+    )
+    if pair is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown lesson")
+    from arix.scheduler import jobs
+
+    await jobs.enqueue(
+        scope.session, scope.ctx.id, "lesson_cancelled_notice", now_utc(),
+        dedupe_key=jobs.dedupe("lesson_cancelled", lesson_id),
+        payload={"lesson_id": str(lesson_id), "reason": body.reason or ""},
+        timezone=scope.ctx.tz_name, respect_quiet_hours=False,
+    )
+    return {"ok": True, "status": pair[0].status}
+
+
+@router.get("/trials")
+async def list_trials(scope: Scope) -> list[dict]:
+    rows = (
+        await scope.session.execute(
+            select(TrialLesson)
+            .where(TrialLesson.tenant_id == scope.ctx.id, TrialLesson.active.is_(True))
+            .order_by(TrialLesson.starts_at)
+        )
+    ).scalars()
+    return [
+        {
+            "id": str(row.id),
+            "starts_at": row.starts_at,
+            "capacity": row.capacity,
+            "course_id": str(row.course_id) if row.course_id else None,
+            "group_id": str(row.group_id) if row.group_id else None,
+        }
+        for row in rows
+    ]
+
+
+@router.post("/attendance")
+async def mark_attendance(body: AttendanceIn, scope: Scope) -> dict:
+    outcome = await att.mark_attendance(
+        scope.session, scope.ctx, body.lesson_id, body.absent_student_ids
+    )
+    if outcome.get("error"):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, outcome["error"])
+    return outcome
 
 
 # ---------------------------------------------------------------- dialogs ---
@@ -457,9 +480,7 @@ async def conversation_messages(
     rows = (
         await scope.session.execute(
             select(Message)
-            .where(
-                Message.tenant_id == scope.ctx.id, Message.conversation_id == conversation_id
-            )
+            .where(Message.tenant_id == scope.ctx.id, Message.conversation_id == conversation_id)
             .order_by(Message.seq)
             .limit(limit)
         )
@@ -479,7 +500,6 @@ async def conversation_messages(
 
 @router.post("/conversations/{conversation_id}/reply")
 async def manual_reply(conversation_id: uuid.UUID, text: str, scope: Scope) -> dict:
-    """Admin writes to the patient from the panel; the bot stands down."""
     from arix.domain.conversations import assign_to_human
     from arix.domain.messaging import send_message
 
@@ -493,9 +513,7 @@ async def manual_reply(conversation_id: uuid.UUID, text: str, scope: Scope) -> d
     if conversation is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown conversation")
     await assign_to_human(scope.session, conversation, None)
-    outcome = await send_message(
-        scope.session, scope.ctx, conversation, text, sender="admin"
-    )
+    outcome = await send_message(scope.session, scope.ctx, conversation, text, sender="admin")
     return {"ok": outcome.ok, "error": outcome.error or outcome.skipped_reason}
 
 
@@ -521,7 +539,9 @@ async def list_handoffs(scope: Scope, open_only: bool = True) -> list[dict]:
     stmt = select(Handoff).where(Handoff.tenant_id == scope.ctx.id)
     if open_only:
         stmt = stmt.where(Handoff.resolved_at.is_(None))
-    rows = (await scope.session.execute(stmt.order_by(Handoff.created_at.desc()).limit(100))).scalars()
+    rows = (
+        await scope.session.execute(stmt.order_by(Handoff.created_at.desc()).limit(100))
+    ).scalars()
     return [
         {
             "id": str(row.id),
@@ -538,7 +558,6 @@ async def list_handoffs(scope: Scope, open_only: bool = True) -> list[dict]:
     ]
 
 
-# --------------------------------------------------------------------- KB ---
 @router.get("/kb")
 async def list_kb(scope: Scope) -> list[dict]:
     rows = (
@@ -590,7 +609,6 @@ async def delete_kb(item_id: uuid.UUID, scope: Scope) -> None:
     )
 
 
-# ------------------------------------------------------------------ stats ---
 @router.get("/report/daily")
 async def daily_report(scope: Scope, day: date | None = None) -> dict:
     report = await build_daily_report(scope.session, scope.ctx, day)
@@ -623,11 +641,13 @@ async def funnel(scope: Scope, days: int = Query(default=7, ge=1, le=90)) -> dic
             .limit(days)
         )
     ).scalars()
+    debts = await bl.debt_summary(scope.session, scope.ctx)
     return {
         "window_days": days,
         "events": counts,
         "handoff_reasons": {reason: count for reason, count in handoff_reasons},
         "daily": [row.data for row in metrics],
+        "debts": {"students": debts["students"], "total": debts["total"], "currency": debts["currency"]},
     }
 
 

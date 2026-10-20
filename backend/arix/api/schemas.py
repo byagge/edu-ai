@@ -10,12 +10,12 @@ from pydantic import BaseModel, ConfigDict, Field
 class TenantCreate(BaseModel):
     slug: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,62}$")
     name: str
-    vertical: str = "clinic"
-    country: str = "KZ"
+    vertical: str = "edu"
+    country: str = "UZ"
     city: str | None = None
-    timezone: str = "Asia/Almaty"
-    languages: list[str] = Field(default_factory=lambda: ["ru"])
-    template: str | None = "clinic_dental"
+    timezone: str = "Asia/Tashkent"
+    languages: list[str] = Field(default_factory=lambda: ["ru", "uz"])
+    template: str | None = "edu_language"
     status: str = "pilot"
     plan: str = "pilot"
 

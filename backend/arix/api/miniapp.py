@@ -1,9 +1,8 @@
-"""Mini App API (Telegram WebApp).
+"""Mini App for a parent, an adult learner or a teacher.
 
-Authentication is the Telegram ``initData`` signature: we verify it against
-the bot token, so a patient cannot read someone else's visits by changing an
-id in the URL.  Every endpoint derives the contact from the verified Telegram
-user, never from the request body.
+Authentication is the Telegram ``initData`` signature. Every endpoint derives
+the contact from that signature, and a parent only ever sees their own
+students (``students_of_contact``).
 """
 from __future__ import annotations
 
@@ -15,37 +14,37 @@ from datetime import date
 from typing import Annotated
 from urllib.parse import parse_qsl
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select
 
 from arix.core.context import TenantContext, load_context_by_slug
 from arix.core.crypto import decrypt_json
-from arix.core.timeutil import humanize_local, now_utc, to_tenant
-from arix.db.models_core import Channel, Contact, ContactIdentity, Conversation
+from arix.core.timeutil import humanize_local, now_utc
+from arix.db.models_core import Channel, Contact, ContactIdentity, Conversation, Staff
 from arix.db.session import tenant_session
-from arix.verticals.clinic import booking as bk
-from arix.verticals.clinic.scheduling import schedule_visit_jobs
+from arix.verticals.edu import attendance as att
+from arix.verticals.edu import billing as bl
+from arix.verticals.edu import enrollment as en
+from arix.verticals.edu import trials as tr
+from arix.verticals.edu.models import Course, Enrollment, Group, Lesson
 
 router = APIRouter(prefix="/miniapp/{slug}", tags=["miniapp"])
 
 INIT_DATA_TTL_SECONDS = 24 * 3600
 
 
-class MiniAppBooking(BaseModel):
-    slot_key: str
-    name: str | None = None
-    phone: str | None = None
-    consent_pd: bool = False
+class TrialBookIn(BaseModel):
+    trial_id: uuid.UUID
+    student_name: str
+    birth_year: int | None = None
 
 
-class MiniAppPayment(BaseModel):
-    visit_id: uuid.UUID
-    amount: float
+class PayInvoiceIn(BaseModel):
+    invoice_id: uuid.UUID
 
 
 def verify_init_data(init_data: str, bot_token: str) -> dict:
-    """Verify Telegram WebApp ``initData`` (HMAC over the sorted fields)."""
     pairs = dict(parse_qsl(init_data, keep_blank_values=True))
     provided = pairs.pop("hash", None)
     if not provided:
@@ -156,12 +155,12 @@ Scope = Annotated[MiniAppScope, Depends(miniapp_scope)]
 
 @router.get("/profile")
 async def profile(scope: Scope) -> dict:
+    students = await en.students_of_contact(scope.session, scope.ctx.id, scope.contact.id)
     return {
         "tenant": {
             "name": scope.ctx.name,
             "city": scope.ctx.tenant.city,
             "address": scope.ctx.settings.address,
-            "map_url": scope.ctx.settings.map_url,
             "phone": scope.ctx.settings.phone,
             "currency": scope.ctx.currency,
             "languages": scope.ctx.languages,
@@ -173,232 +172,204 @@ async def profile(scope: Scope) -> dict:
             "consent_pd": scope.contact.consent_pd_at is not None,
             "lang": scope.contact.lang,
         },
+        "students": [{"id": str(row.id), "name": row.name, "status": row.status} for row in students],
     }
 
 
-@router.get("/services")
-async def services(scope: Scope, category: str | None = None) -> list[dict]:
-    rows = await bk.list_services(scope.session, scope.ctx.id, category=category, limit=100)
+@router.get("/courses")
+async def courses(scope: Scope) -> list[dict]:
+    rows = (
+        await scope.session.execute(
+            select(Course).where(Course.tenant_id == scope.ctx.id, Course.active.is_(True))
+        )
+    ).scalars()
+    lang = scope.contact.lang
     return [
         {
-            "service_id": str(row.id),
-            "name": row.label(scope.contact.lang),
-            "category": row.category,
-            "price": bk.service_price_text(row),
-            "price_from": float(row.price_from) if row.price_from is not None else None,
-            "duration_min": row.duration_min,
-            "online_bookable": row.online_bookable,
+            "course_id": str(row.id),
+            "name": row.label(lang),
+            "price_month": float(row.price_month) if row.price_month is not None else None,
+            "currency": row.currency,
+            "has_trial": row.has_trial,
         }
         for row in rows
     ]
 
 
-@router.get("/doctors")
-async def doctors(scope: Scope, service_id: uuid.UUID | None = None) -> list[dict]:
-    rows = await bk.list_doctors(scope.session, scope.ctx.id, service_id=service_id)
+@router.get("/groups")
+async def groups(scope: Scope, course_id: uuid.UUID | None = None) -> list[dict]:
+    offers = await en.list_groups(scope.session, scope.ctx, course_id=course_id)
     return [
         {
-            "doctor_id": str(row.id),
-            "name": row.name,
-            "specialty": row.specialty,
-            "langs": list(row.langs or []),
-            "bio": row.bio_short,
-            "photo_url": row.photo_url,
+            "group_id": str(offer.group_id),
+            "name": offer.name,
+            "schedule": offer.schedule_text,
+            "seats_left": offer.seats_left,
+            "price_month": offer.price_month,
+            "currency": offer.currency,
         }
-        for row in rows
+        for offer in offers
     ]
 
 
-@router.get("/slots")
-async def slots(
-    scope: Scope,
-    service_id: uuid.UUID,
-    doctor_id: uuid.UUID | None = None,
-    date_from: date | None = None,
-    date_to: date | None = None,
-    count: int = Query(default=12, le=50),
-) -> list[dict]:
-    offers = await bk.find_slots(
+@router.get("/schedule")
+async def schedule(scope: Scope) -> list[dict]:
+    students = await en.students_of_contact(scope.session, scope.ctx.id, scope.contact.id)
+    if not students:
+        return []
+    student_ids = [row.id for row in students]
+    rows = (
+        await scope.session.execute(
+            select(Lesson, Group)
+            .join(Group, Group.id == Lesson.group_id)
+            .join(Enrollment, Enrollment.group_id == Group.id)
+            .where(
+                Lesson.tenant_id == scope.ctx.id,
+                Enrollment.student_id.in_(student_ids),
+                Enrollment.status.in_(["reserved", "active"]),
+                Lesson.status == "planned",
+                Lesson.starts_at >= now_utc(),
+            )
+            .order_by(Lesson.starts_at)
+            .limit(20)
+        )
+    ).all()
+    lang = scope.contact.lang
+    return [
+        {
+            "lesson_id": str(lesson.id),
+            "group": group.name,
+            "when": humanize_local(lesson.starts_at, scope.ctx.tz_name, lang),
+            "starts_at": lesson.starts_at,
+        }
+        for lesson, group in rows
+    ]
+
+
+@router.get("/balance")
+async def balance(scope: Scope) -> dict:
+    students = await en.students_of_contact(scope.session, scope.ctx.id, scope.contact.id)
+    items = []
+    for student in students:
+        snapshot = await bl.student_balance(scope.session, scope.ctx, student.id)
+        items.append({"student_id": str(student.id), "name": student.name, **snapshot})
+    return {"students": items}
+
+
+@router.get("/trials")
+async def trials(scope: Scope, course_id: uuid.UUID | None = None) -> list[dict]:
+    offers = await tr.find_trials(scope.session, scope.ctx, course_id=course_id, limit=8)
+    lang = scope.contact.lang
+    return [
+        {
+            "trial_id": str(offer.trial_id),
+            "when": humanize_local(offer.starts_at, scope.ctx.tz_name, lang),
+            "seats_left": offer.seats_left,
+            "course": offer.course_name,
+        }
+        for offer in offers
+    ]
+
+
+@router.post("/trials")
+async def book_trial(body: TrialBookIn, scope: Scope) -> dict:
+    student = await en.ensure_student(
         scope.session, scope.ctx,
-        service_id=service_id, doctor_id=doctor_id,
-        date_from=date_from, date_to=date_to, count=count,
+        contact=scope.contact,
+        name=body.student_name,
+        birth_year=body.birth_year,
     )
-    tz = scope.ctx.tz_name
-    return [
-        {
-            "slot_key": o.key,
-            "doctor": o.doctor_name,
-            "doctor_id": str(o.doctor_id),
-            "date": to_tenant(o.start, tz).strftime("%Y-%m-%d"),
-            "time": to_tenant(o.start, tz).strftime("%H:%M"),
-            "when": humanize_local(o.start, tz, scope.contact.lang),
-        }
-        for o in offers
-    ]
-
-
-@router.post("/book", status_code=201)
-async def book(body: MiniAppBooking, scope: Scope) -> dict:
-    from arix.core.pii import normalize_phone
-
     try:
-        doctor_id, service_id, start = bk.SlotOffer.parse_key(body.slot_key)
-    except (ValueError, AttributeError) as exc:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "bad slot_key") from exc
-
-    if body.name:
-        scope.contact.name = body.name[:160]
-    if body.phone:
-        phone = normalize_phone(body.phone, scope.ctx.tenant.country)
-        if phone:
-            scope.contact.phone = phone
-    if body.consent_pd and scope.contact.consent_pd_at is None:
-        scope.contact.consent_pd_at = now_utc()
-
-    missing = [
-        field
-        for field, ok in (
-            ("name", bool(scope.contact.name)),
-            ("phone", bool(scope.contact.phone)),
-            ("consent_pd", scope.contact.consent_pd_at is not None),
-        )
-        if not ok
-    ]
-    if missing:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY, {"error": "missing_fields", "missing": missing}
-        )
-
-    service = await bk.get_service(scope.session, scope.ctx.id, service_id)
-    if service is None or not service.online_bookable:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "service is not bookable online")
-
-    try:
-        visit = await bk.hold_slot(
+        booking = await tr.book_trial(
             scope.session, scope.ctx,
-            contact_id=scope.contact.id, doctor_id=doctor_id, service_id=service_id,
-            start=start, source="miniapp", attribution="miniapp",
-            idempotency_key=f"miniapp:{scope.contact.id}:{body.slot_key}",
+            trial_id=body.trial_id,
+            student_id=student.id,
+            attribution="miniapp",
+            idempotency_key=f"mini:{scope.contact.id}:{body.trial_id}:{student.id}",
         )
-    except bk.SlotTaken as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, "slot is already taken") from exc
+    except tr.TrialFull as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, "trial is full") from exc
+    from arix.verticals.edu.scheduling import schedule_trial_jobs
 
-    await bk.confirm_visit(scope.session, scope.ctx, visit.id)
-    await schedule_visit_jobs(scope.session, scope.ctx, visit.id)
-    refs = await bk.visit_with_refs(scope.session, scope.ctx.id, visit.id)
-    assert refs is not None
-    v, doctor, svc, _contact = refs
-    return {
-        "visit_id": str(v.id),
-        "when": humanize_local(v.starts_at, scope.ctx.tz_name, scope.contact.lang),
-        "doctor": doctor.name,
-        "service": svc.label(scope.contact.lang),
-        "address": scope.ctx.settings.address,
-        "map_url": scope.ctx.settings.map_url,
-    }
-
-
-@router.get("/my/visits")
-async def my_visits(scope: Scope) -> list[dict]:
-    visits = await bk.upcoming_visits(
-        scope.session, scope.ctx.id, scope.contact.id, include_past_hours=24 * 90
-    )
-    out = []
-    for visit in visits:
-        refs = await bk.visit_with_refs(scope.session, scope.ctx.id, visit.id)
-        if refs is None:
-            continue
-        _, doctor, service, _ = refs
-        out.append(
-            {
-                "visit_id": str(visit.id),
-                "starts_at": visit.starts_at,
-                "when": humanize_local(visit.starts_at, scope.ctx.tz_name, scope.contact.lang),
-                "doctor": doctor.name,
-                "service": service.label(scope.contact.lang),
-                "status": visit.status,
-                "price_from": float(visit.price_quoted) if visit.price_quoted else None,
-            }
-        )
-    return out
-
-
-@router.post("/my/visits/{visit_id}/cancel")
-async def cancel(visit_id: uuid.UUID, scope: Scope) -> dict:
-    from arix.verticals.clinic.scheduling import cancel_visit_jobs
-
-    visit = (
-        await scope.session.execute(
-            select(bk.Visit).where(
-                bk.Visit.tenant_id == scope.ctx.id,
-                bk.Visit.id == visit_id,
-                bk.Visit.contact_id == scope.contact.id,
-            )
-        )
-    ).scalar_one_or_none()
-    if visit is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown visit")
-    await bk.cancel_visit(scope.session, scope.ctx, visit_id, "miniapp")
-    await cancel_visit_jobs(scope.session, scope.ctx, visit_id)
-    return {"ok": True}
-
-
-@router.post("/my/visits/{visit_id}/reschedule")
-async def reschedule(visit_id: uuid.UUID, slot_key: str, scope: Scope) -> dict:
-    from arix.verticals.clinic.scheduling import cancel_visit_jobs
-
-    try:
-        doctor_id, _service_id, start = bk.SlotOffer.parse_key(slot_key)
-    except (ValueError, AttributeError) as exc:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "bad slot_key") from exc
-    owned = (
-        await scope.session.execute(
-            select(bk.Visit.id).where(
-                bk.Visit.tenant_id == scope.ctx.id,
-                bk.Visit.id == visit_id,
-                bk.Visit.contact_id == scope.contact.id,
-            )
-        )
-    ).scalar_one_or_none()
-    if owned is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown visit")
-    try:
-        moved = await bk.reschedule(
-            scope.session, scope.ctx, visit_id, start, new_doctor_id=doctor_id
-        )
-    except bk.SlotTaken as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, "slot is already taken") from exc
-    await cancel_visit_jobs(scope.session, scope.ctx, visit_id)
-    await schedule_visit_jobs(scope.session, scope.ctx, moved.id)
-    return {
-        "visit_id": str(moved.id),
-        "when": humanize_local(moved.starts_at, scope.ctx.tz_name, scope.contact.lang),
-    }
+    await schedule_trial_jobs(scope.session, scope.ctx, booking.id)
+    return {"booking_id": str(booking.id), "student_id": str(student.id)}
 
 
 @router.post("/pay")
-async def pay(body: MiniAppPayment, scope: Scope) -> dict:
+async def pay(body: PayInvoiceIn, scope: Scope) -> dict:
     from arix.payments import create_payment
+    from arix.verticals.edu.models import Invoice
 
     if not scope.ctx.settings.features.miniapp_payments:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "payments are disabled for this tenant")
-    owned = (
+    students = await en.students_of_contact(scope.session, scope.ctx.id, scope.contact.id)
+    allowed = {row.id for row in students}
+    invoice = (
         await scope.session.execute(
-            select(bk.Visit.id).where(
-                bk.Visit.tenant_id == scope.ctx.id,
-                bk.Visit.id == body.visit_id,
-                bk.Visit.contact_id == scope.contact.id,
+            select(Invoice).where(
+                Invoice.tenant_id == scope.ctx.id, Invoice.id == body.invoice_id
             )
         )
     ).scalar_one_or_none()
-    if owned is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown visit")
+    if invoice is None or invoice.student_id not in allowed:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown invoice")
     payment, url = await create_payment(
         scope.session, scope.ctx,
-        contact_id=scope.contact.id, amount=body.amount,
-        entity_ref=str(body.visit_id), attributed_to="miniapp",
+        amount=invoice.amount,
+        currency=invoice.currency,
+        contact_id=scope.contact.id,
+        entity_ref=str(invoice.id),
+        attributed_to="miniapp",
     )
-    return {"payment_id": str(payment.id), "url": url, "provider": payment.provider}
+    return {"payment_id": str(payment.id), "url": url}
+
+
+@router.get("/teacher/today")
+async def teacher_today(scope: Scope, day: date | None = None) -> dict:
+    """Today's groups for a teacher logged in with the same Telegram account."""
+    member = (
+        await scope.session.execute(
+            select(Staff).where(
+                Staff.tenant_id == scope.ctx.id,
+                Staff.tg_user_id == int(scope.conversation.peer_id),
+                Staff.role == "teacher",
+                Staff.active.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if member is None or member.entity_id is None:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "teacher only")
+    rows = (
+        await scope.session.execute(
+            select(Lesson, Group)
+            .join(Group, Group.id == Lesson.group_id)
+            .where(
+                Lesson.tenant_id == scope.ctx.id,
+                Group.teacher_id == member.entity_id,
+                Lesson.status == "planned",
+            )
+            .order_by(Lesson.starts_at)
+            .limit(12)
+        )
+    ).all()
+    return {
+        "lessons": [
+            {
+                "lesson_id": str(lesson.id),
+                "group": group.name,
+                "starts_at": lesson.starts_at,
+            }
+            for lesson, group in rows
+        ]
+    }
+
+
+@router.get("/attendance/{student_id}")
+async def student_attendance(student_id: uuid.UUID, scope: Scope) -> dict:
+    students = await en.students_of_contact(scope.session, scope.ctx.id, scope.contact.id)
+    if student_id not in {row.id for row in students}:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown student")
+    return await att.student_attendance_report(scope.session, scope.ctx, student_id)
 
 
 __all__ = ["router", "verify_init_data"]
