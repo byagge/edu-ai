@@ -28,6 +28,7 @@ jobs:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/arix_test
       TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/arix_test
       SECRET_KEY: ci-secret-key-at-least-32-characters
+      VERTICAL: edu
       # No API key in CI: the deterministic brain keeps the suite hermetic.
       LLM_FORCE_SCRIPTED: "true"
       CHANNELS_DRY_RUN: "true"
@@ -46,12 +47,15 @@ jobs:
       - name: Lint
         working-directory: backend
         run: python -m ruff check arix tests
-      # WIP: the edu migration, API layer and eval set are not written yet
-      # (see docs/STATUS.md). Until then CI only runs the shared-core unit
-      # tests, so a red build always means a real regression.
-      - name: Tests (shared core, unit only)
+      # The 60-dialogue pilot suite is still P1-1. CI runs the tests that
+      # exist, including the database suite, and does not treat the starter
+      # eval as the pilot bar.
+      - name: Migrate
         working-directory: backend
-        run: python -m pytest -q tests/test_guardrails.py tests/test_pii.py tests/test_timeutil.py
+        run: python -m alembic upgrade head
+      - name: Tests
+        working-directory: backend
+        run: python -m pytest -q
 
   frontend:
     runs-on: ubuntu-latest

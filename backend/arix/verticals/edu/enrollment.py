@@ -15,6 +15,7 @@ from datetime import date, timedelta
 from sqlalchemy import Select, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import noload
 
 from arix.core.context import TenantContext
 from arix.core.events import ENROLLED, log_event
@@ -320,9 +321,12 @@ async def enroll(
 
     # Lock the group row: capacity is a count, so the check and the insert must
     # not interleave with another dialogue taking the same last seat.
+    # ``Group.course`` is joined-eager. FOR UPDATE cannot ride an outer join, so
+    # the lock query must touch only ``groups``. The course is loaded below.
     group = (
         await session.execute(
             select(Group)
+            .options(noload(Group.course))
             .where(Group.tenant_id == ctx.id, Group.id == group_id)
             .with_for_update()
         )

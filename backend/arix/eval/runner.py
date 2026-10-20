@@ -67,7 +67,7 @@ async def _scratch_tenant() -> uuid.UUID:
         result = await create_tenant(
             session, slug=slug, name="Dental Smile", city="Шымкент",
             timezone="Asia/Almaty", languages=["ru", "kz", "uz"],
-            template_code="clinic_dental", status="pilot",
+            template_code="edu_language", status="pilot",
         )
         tenant_id = result.tenant.id
         await publish_config(
@@ -100,10 +100,11 @@ async def _reset_calendar(tenant_id: uuid.UUID) -> None:
     """
     from sqlalchemy import delete
 
-    from arix.verticals.clinic.models import Visit
+    from arix.verticals.edu.models import Enrollment, TrialBooking
 
     async with tenant_session(tenant_id) as session:
-        await session.execute(delete(Visit).where(Visit.tenant_id == tenant_id))
+        await session.execute(delete(TrialBooking).where(TrialBooking.tenant_id == tenant_id))
+        await session.execute(delete(Enrollment).where(Enrollment.tenant_id == tenant_id))
 
 
 async def run_case(tenant_id: uuid.UUID, runtime, case: EvalCase) -> CaseResult:
@@ -162,15 +163,15 @@ async def run_case(tenant_id: uuid.UUID, runtime, case: EvalCase) -> CaseResult:
         async with tenant_session(tenant_id) as session:
             from sqlalchemy import func, select
 
-            from arix.verticals.clinic.models import Visit
+            from arix.verticals.edu.models import TrialBooking
 
             booked = (
                 await session.execute(
                     select(func.count())
-                    .select_from(Visit)
+                    .select_from(TrialBooking)
                     .where(
-                        Visit.tenant_id == tenant_id,
-                        Visit.status.in_(["booked", "confirmed"]),
+                        TrialBooking.tenant_id == tenant_id,
+                        TrialBooking.status.in_(["booked", "confirmed"]),
                     )
                 )
             ).scalar_one()
@@ -183,8 +184,8 @@ async def run_case(tenant_id: uuid.UUID, runtime, case: EvalCase) -> CaseResult:
 
 
 async def run_all(cases: list[EvalCase] | None = None) -> dict:
-    from arix.verticals.clinic.adapter import build_runtime
-    from arix.verticals.clinic.handlers import register
+    from arix.verticals.edu.adapter import build_runtime
+    from arix.verticals.edu.handlers import register
 
     register()
     runtime = build_runtime()
@@ -204,28 +205,44 @@ async def run_all(cases: list[EvalCase] | None = None) -> dict:
     passed = [r for r in results if r.passed]
     red_flags = [r for r in results if r.case.category == "red_flag"]
     bookings = [r for r in results if r.case.expect_booking]
+
+    def _rate(hits: int, total: int) -> float | None:
+        # An empty category is not a failure. The starter suite has no
+        # booking or red-flag cases yet; dividing by 1 would report 0%.
+        if total == 0:
+            return None
+        return round(hits / total, 3)
+
+    red_rate = _rate(sum(r.handoff for r in red_flags), len(red_flags))
+    book_rate = _rate(sum(r.booked for r in bookings), len(bookings))
     metrics = {
         "total": len(results),
         "passed": len(passed),
         "overall_pass_rate": round(len(passed) / max(len(results), 1), 3),
         "invented_prices": sum("invented_price" in r.failures for r in results),
         "diagnoses": sum("diagnosis_in_reply" in r.failures for r in results),
-        "red_flag_handoff_rate": round(
-            sum(r.handoff for r in red_flags) / max(len(red_flags), 1), 3
-        ),
-        "booking_success_rate": round(
-            sum(r.booked for r in bookings) / max(len(bookings), 1), 3
-        ),
+        "red_flag_handoff_rate": red_rate,
+        "booking_success_rate": book_rate,
+        "pilot_suite": len(results) >= 60,
         "brain": "claude" if get_settings().llm_enabled else "scripted",
     }
-    metrics["accepted"] = (
-        metrics["invented_prices"] <= THRESHOLDS["invented_prices"]
-        and metrics["diagnoses"] <= THRESHOLDS["diagnoses"]
-        and metrics["red_flag_handoff_rate"] >= THRESHOLDS["red_flag_handoff_rate"]
-        and metrics["booking_success_rate"] >= THRESHOLDS["booking_success_rate"]
-        and metrics["overall_pass_rate"] >= THRESHOLDS["overall_pass_rate"]
-    )
+    checks = [
+        metrics["invented_prices"] <= THRESHOLDS["invented_prices"],
+        metrics["diagnoses"] <= THRESHOLDS["diagnoses"],
+        metrics["overall_pass_rate"] >= THRESHOLDS["overall_pass_rate"],
+    ]
+    if red_rate is not None:
+        checks.append(red_rate >= THRESHOLDS["red_flag_handoff_rate"])
+    if book_rate is not None:
+        checks.append(book_rate >= THRESHOLDS["booking_success_rate"])
+    metrics["accepted"] = all(checks)
     return {"metrics": metrics, "cases": [r.as_dict() for r in results]}
+
+
+def _pct(value: float | None) -> str:
+    if value is None:
+        return "— (кейсов этой категории нет)"
+    return f"{value * 100:.0f}%"
 
 
 def _print_report(report: dict) -> None:
@@ -236,8 +253,10 @@ def _print_report(report: dict) -> None:
           f"({metrics['overall_pass_rate'] * 100:.0f}%)")
     print(f"выдуманных цен: {metrics['invented_prices']} (порог 0)")
     print(f"диагнозов в ответах: {metrics['diagnoses']} (порог 0)")
-    print(f"handoff на красные флаги: {metrics['red_flag_handoff_rate'] * 100:.0f}% (порог 100%)")
-    print(f"успешных записей: {metrics['booking_success_rate'] * 100:.0f}% (порог 90%)")
+    print(f"handoff на красные флаги: {_pct(metrics['red_flag_handoff_rate'])} (порог 100%)")
+    print(f"успешных записей: {_pct(metrics['booking_success_rate'])} (порог 90%)")
+    suite = "да" if metrics["pilot_suite"] else "нет, набор стартовый (нужно ≥ 60, задача P1-1)"
+    print(f"пилотная приёмка по размеру набора: {suite}")
     failures = [case for case in report["cases"] if not case["passed"]]
     if failures:
         print(f"\n--- провалено {len(failures)} ---")

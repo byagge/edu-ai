@@ -1,11 +1,14 @@
-# ARIX — ИИ-менеджер клиники. Полный стек одной командой:
+# ARIX — ИИ-менеджер учебного центра. Полный стек одной командой:
 #   cp .env.example .env && make demo
+#
+# Порты на хосте сдвинуты относительно clinic-ai, чтобы оба стека
+# поднимались на одной машине.
 #
 # Профили:
 #   (по умолчанию) postgres, redis, backend, worker, waweb, frontend
 #   tools          — миграции и сиды (запускаются один раз)
 
-name: arix-clinic
+name: arix-edu
 
 x-backend-env: &backend-env
   env_file: [.env]
@@ -13,7 +16,7 @@ x-backend-env: &backend-env
     DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-arix_app}:${POSTGRES_PASSWORD:-arix}@postgres:5432/${POSTGRES_DB:-arix}
     REDIS_URL: redis://redis:6379/0
     WA_BAILEYS_URL: http://waweb:3000
-    VERTICAL: clinic
+    VERTICAL: edu
 
 services:
   postgres:
@@ -31,8 +34,9 @@ services:
       ARIX_APP_PASSWORD: ${POSTGRES_PASSWORD:-arix}
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/10-init-db.sql:ro
-    ports: ["${POSTGRES_PORT:-5432}:5432"]
+      - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/10-init-db.sh:ro
+      - ./scripts/init-db.sql:/usr/local/share/arix/init-db.sql:ro
+    ports: ["${POSTGRES_PORT:-5433}:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d ${POSTGRES_DB:-arix}"]
       interval: 5s
@@ -75,7 +79,7 @@ services:
     command: >
       sh -c "python -m alembic upgrade head &&
              uvicorn arix.main:app --host 0.0.0.0 --port 8000 --proxy-headers"
-    ports: ["${BACKEND_PORT:-8000}:8000"]
+    ports: ["${BACKEND_PORT:-8001}:8000"]
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
@@ -100,15 +104,15 @@ services:
       WA_AUTH_DIR: /data/sessions
       LOG_LEVEL: ${LOG_LEVEL:-info}
     volumes: [wasessions:/data/sessions]
-    ports: ["${WAWEB_PORT:-3001}:3000"]
+    ports: ["${WAWEB_PORT:-3003}:3000"]
 
   frontend:
     build:
       context: ./frontend
       args:
-        VITE_API_BASE: ${PUBLIC_API_BASE:-http://localhost:8000}
+        VITE_API_BASE: ${PUBLIC_API_BASE:-http://localhost:8001}
     restart: unless-stopped
-    ports: ["${FRONTEND_PORT:-3000}:80"]
+    ports: ["${FRONTEND_PORT:-3002}:80"]
     depends_on:
       backend: {condition: service_started}
 

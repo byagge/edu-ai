@@ -108,6 +108,26 @@ class EduVertical:
             when = humanize_local(refs[1].starts_at, ctx.tz_name, lang) if refs else ""
             return ButtonOutcome(reply=f"Записала на пробное {when}.", label="trial_booked")
 
+        if action == "pick" and len(parts) >= 3:
+            from arix.agent.scripted import ask_for
+
+            needed = [
+                field
+                for field, known in (
+                    ("name", bool(contact.name)),
+                    ("phone", bool(contact.phone)),
+                    ("consent_pd", contact.consent_pd_at is not None),
+                )
+                if not known
+            ]
+            scratch = dict(conversation.scratch or {})
+            scratch["pending_trial_key"] = parts[2]
+            scratch["still_needed"] = needed
+            conversation.scratch = scratch
+            await session.flush()
+            reply = ask_for(needed) if needed else "Время выбрано. Напишите «да», и я запишу."
+            return ButtonOutcome(reply=reply, label="trial_pick")
+
         booking_id = uuid.UUID(parts[2]) if len(parts) > 2 else None
         if booking_id is None:
             return None

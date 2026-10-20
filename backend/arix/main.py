@@ -38,13 +38,25 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     s = get_settings()
-    app = FastAPI(
-        title="ARIX — ИИ-менеджер клиники",
-        version="1.0.0",
-        description=(
+    titles = {
+        "edu": "ARIX — ИИ-менеджер учебного центра",
+        "clinic": "ARIX — ИИ-менеджер клиники",
+    }
+    descriptions = {
+        "edu": (
+            "Мультитенантный ИИ-менеджер учебного центра: Telegram "
+            "(включая Telegram Business), WhatsApp через Baileys, пробные, "
+            "зачисление, счета и отчёты."
+        ),
+        "clinic": (
             "Мультитенантный ИИ-менеджер: Telegram (включая Telegram Business), "
             "WhatsApp через Baileys, запись на приём, напоминания, дожим, отчёты."
         ),
+    }
+    app = FastAPI(
+        title=titles.get(s.vertical, "ARIX"),
+        version="1.0.0",
+        description=descriptions.get(s.vertical, titles.get(s.vertical, "ARIX")),
         lifespan=lifespan,
         docs_url="/docs",
         openapi_url="/openapi.json",
